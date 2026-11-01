@@ -1,0 +1,41 @@
+//! Reading Log: [`log`] over the reading logs, [`library`], [`record`],
+//! [`stats`] over those, and [`view`] drawing them.
+
+// Docs name the private helpers beside them: this crate is read with
+// `--document-private-items`.
+#![allow(rustdoc::private_intra_doc_links)]
+
+pub mod app;
+pub mod applog;
+pub mod backup;
+pub mod clippings;
+pub mod clock;
+pub mod covers;
+pub mod date;
+pub mod eink;
+pub mod font;
+pub mod hanfold;
+pub mod highlights;
+pub mod identify;
+pub mod keyboard;
+pub mod lang;
+pub mod library;
+pub mod lipc;
+pub mod log;
+pub mod mark;
+pub mod markdown;
+pub mod net;
+pub mod open;
+pub mod orientation;
+pub mod record;
+pub mod settings;
+pub mod sidecar;
+pub mod stamp;
+pub mod stats;
+pub mod ui;
+pub mod update;
+pub mod view;
+pub mod vocab;
+pub mod wrap;
+pub mod written;
+pub mod zone;

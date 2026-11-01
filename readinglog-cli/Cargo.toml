@@ -1,0 +1,10 @@
+[package]
+name = "kindle-readinglog-export"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+readinglog-native = { path = "../vendor/readinglog/native" }
+serde_json = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
