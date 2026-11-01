@@ -1,0 +1,36 @@
+{
+  "items": [
+    {
+      "name": "Export root compatibility probe",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh probe"
+    },
+    {
+      "name": "Install / upgrade (collection only)",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh install"
+    },
+    {
+      "name": "Enable collection",
+      "action": "sh /var/local/kindle-native-sync/install/control.sh enable"
+    },
+    {
+      "name": "Disable collection",
+      "action": "sh /var/local/kindle-native-sync/install/control.sh disable"
+    },
+    {
+      "name": "Status",
+      "action": "sh /var/local/kindle-native-sync/install/control.sh status"
+    },
+    {
+      "name": "Import USB configuration",
+      "action": "sh /var/local/kindle-native-sync/install/control.sh import-config"
+    },
+    {
+      "name": "Export sanitized status",
+      "action": "sh /var/local/kindle-native-sync/install/control.sh export"
+    },
+    {
+      "name": "Uninstall (keep ledger)",
+      "action": "sh /var/local/kindle-native-sync/install/control.sh uninstall"
+    }
+  ]
+}

@@ -228,6 +228,22 @@ class EngineTests(unittest.TestCase):
         self.engine._injected_credentials={**AUTH,"vid":"other-synthetic-account"}
         self.assertIsNone(self.engine.list_books()[0]["weread_book_id"])
 
+    def test_device_handoff_fence_blocks_mac_before_any_request(self):
+        self.add(seconds=20);self.imported();self.engine.save_mapping("A","123")
+        plan=self.engine.prepare()
+        (self.root/".weread/device-handoff.json").write_text('{"state":"prepared"}')
+        result=self.engine.commit(plan["plan_id"],True)
+        self.assertEqual(result["state"],"blocked")
+        self.assertEqual(self.backend.calls,[])
+
+    def test_device_handoff_during_preflight_prevents_post(self):
+        self.add(seconds=20);self.imported();self.engine.save_mapping("A","123")
+        plan=self.engine.prepare()
+        self.backend.before_day_response=lambda:(self.root/".weread/device-handoff.json").write_text("partial-fence")
+        result=self.engine.commit(plan["plan_id"],True)
+        self.assertEqual(result["state"],"blocked")
+        self.assertFalse(any(method=="POST" for method,_,_ in self.backend.calls))
+
     def test_changed_hour_assignment_same_counter_blocks(self):
         self.add(seconds=20);self.imported()
         self.rows[0]["hour"]=21;self.sessions[0]["hours"]=[[21,20]];self.imported()

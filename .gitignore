@@ -28,3 +28,12 @@ __pycache__/
 target/
 .DS_Store
 *.log
+
+# Device build tools and private deployment artifacts
+.device-work/
+dist/
+device/worker/target/
+device/collector/ksync-collector
+device/build/out/
+.kindle-native-sync-inbox/
+.kindle-native-sync-export/

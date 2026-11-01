@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="UTF-8"?><extension><information><name>Native Reading Sync</name><version>0.1.0</version><author>WanhaoZhang</author><id>kindle-native-sync</id></information><menus><menu type="json" dynamic="true">menu.json</menu></menus></extension>

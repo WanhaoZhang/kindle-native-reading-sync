@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "profile": "pw2-5.12.2.1.1",
+  "firmware": "5.12.2.1.1",
+  "config_binding_sha256": "REPLACE_WITH_BOUND_CONFIG_HASH_AFTER_REAL_ACCEPTANCE",
+  "kernel_release": "REPLACE_WITH_ACTUAL_DEVICE_KERNEL_RELEASE",
+  "elf_verified": false,
+  "power_cycle_verified": false,
+  "usb_cycle_verified": false,
+  "performance_verified": false
+}

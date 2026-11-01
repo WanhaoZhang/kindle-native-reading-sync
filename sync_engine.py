@@ -378,6 +378,10 @@ class SyncEngine:
         return plan
 
     def _valid_batch(self, db, batch, account):
+        # Handoff acquires this same SQLite write lock before creating the fence.
+        # Any fence (including a partial or malformed one) disables Mac writes.
+        if (self.private / "device-handoff.json").exists():
+            raise ValueError("上传权已交接给 Kindle；此 Mac 仅保留导入和只读核验，禁止再次上传。")
         key, hour = batch["local_book_id"], batch["hours"][0]
         book = db.execute("SELECT blocked FROM books WHERE source_key=?", (key,)).fetchone()
         mapping = db.execute("SELECT weread_id FROM mappings WHERE account=? AND source_key=?", (account, key)).fetchone()
