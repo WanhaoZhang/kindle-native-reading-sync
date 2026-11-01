@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """E-Ink time-only preparation; guarded single upload requires explicit approval.
 
-SPDX-License-Identifier: GPL-3.0-only
+SPDX-License-Identifier: AGPL-3.0-only
 Protocol/signature transformation adapted from MiuRead readtime_protocol.lua
 @ ee9d6f24768349d428230036087c379dd957b30c and AnkioTomas/moon
 @ 43b2181da6eb5285b62114da85e1413d2f8464e4 (GPL-3.0).
