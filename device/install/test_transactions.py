@@ -51,6 +51,14 @@ if name=='cp':
  fail_once(failure=='copy_job' and str(base/'upstart')+'/' in args[-1])
  os.execv('/bin/cp',['/bin/cp',*args])
 if name=='sha256sum':raise SystemExit(0)
+if name=='sync':
+ snapshot={'backup_complete':(base/'private/upgrade.previous/complete').exists(),
+           'backup_evidence':(base/'private/upgrade.previous/validation-device.json').exists(),
+           'active_evidence':(base/'private/validation-device.json').exists(),
+           'old_binary':(base/'private/bin/ksync-worker').exists() and (base/'private/bin/ksync-worker').read_bytes()==b'OLD WORKER'}
+ with (base/'sync-states').open('a') as log:log.write(json.dumps(snapshot)+'\\n')
+ raise SystemExit(0)
+if name=='mv':os.execv('/bin/mv',['/bin/mv',*args])
 if name=='status':
  path=states/args[0]
  if path.exists() and path.read_text()=='running':print(args[0]+' start/running, process 123');raise SystemExit(0)
@@ -69,7 +77,7 @@ if name=='initctl':
  fail_once(failure=='reload');raise SystemExit(0)
 raise SystemExit(1)
 '''
-        for name in ('fake-mount','cp','sha256sum','status','start','stop','initctl'):
+        for name in ('fake-mount','cp','mv','sync','sha256sum','status','start','stop','initctl'):
             p=self.commands/name;p.write_text(tool);p.chmod(0o700)
         self.private={'auth.json':'PRIVATE_AUTH','config.json':'PRIVATE_CONFIG','ledger.sqlite':'PRIVATE_LEDGER','other-data':'PRIVATE_DATA'}
         for name,body in self.private.items():(self.root/name).write_text(body)
@@ -131,6 +139,19 @@ raise SystemExit(1)
                     r=case.execute(failure=failure);self.assertNotEqual(r.returncode,0,r.stdout)
                     case.assert_restored(collector=True,events=False)
                 finally:case.doCleanups()
+
+    def test_acceptance_is_durably_invalidated_before_any_binary_cutover(self):
+        self.old();r=self.execute();self.assertEqual(r.returncode,0,r.stderr)
+        snapshots=[json.loads(line) for line in (self.base/'sync-states').read_text().splitlines()]
+        self.assertGreaterEqual(len(snapshots),2)
+        self.assertTrue(snapshots[0]['backup_complete']);self.assertTrue(snapshots[0]['backup_evidence'])
+        self.assertTrue(snapshots[0]['active_evidence']);self.assertTrue(snapshots[0]['old_binary'])
+        self.assertTrue(snapshots[1]['backup_complete']);self.assertTrue(snapshots[1]['backup_evidence'])
+        self.assertFalse(snapshots[1]['active_evidence']);self.assertTrue(snapshots[1]['old_binary'])
+        calls=[json.loads(line) for line in self.calls.read_text().splitlines()]
+        barriers=[i for i,c in enumerate(calls) if c==['sync']]
+        cutovers=[i for i,c in enumerate(calls) if c[0]=='mv' and c[1].endswith('/.install-stage/bin')]
+        self.assertEqual(len(cutovers),1);self.assertLess(barriers[1],cutovers[0])
 
     def test_first_install_failure_keeps_selftest_ledger_and_removes_only_new_components(self):
         before=self.snapshot();r=self.execute(failure='start_collector');self.assertNotEqual(r.returncode,0)

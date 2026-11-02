@@ -44,13 +44,16 @@ root_rw
 services_touched=1
 stop_our_jobs
 files_changed=1
+# Remove and persist active acceptance BEFORE replacing any binary. This is not
+# automatic power-loss recovery, but prevents new binaries using old acceptance.
+rm -f "$ROOT/validation-device.json"
+sync
 rm -rf "$ROOT/bin" "$ROOT/install"
 mv "$STAGE/bin" "$ROOT/bin"
 mv "$STAGE/install" "$ROOT/install"
 mv "$STAGE/package-manifest.json" "$ROOT/package-manifest.json"
 if [ -f "$STAGE/ca-bundle.crt" ];then mv "$STAGE/ca-bundle.crt" "$ROOT/ca-bundle.crt";fi
-# New binaries must earn fresh device acceptance; old proof remains in the old set.
-rm -f "$ROOT/validation-device.json"
+# New binaries must earn fresh acceptance; old proof remains in the old set.
 for job in "$COLLECTOR_JOB" "$EVENTS_JOB";do
     cp "$STAGE/upstart/$job.conf" "$JOBS/.$job.conf.new"
     chmod 644 "$JOBS/.$job.conf.new"

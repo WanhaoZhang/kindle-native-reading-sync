@@ -114,6 +114,8 @@ begin_transaction() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
     backup_old_set
+    # Persist the complete recovery copy before any active component is changed.
+    sync
 }
 remove_old_temporaries() {
     # Exact project-owned reserved names only. Never remove ROOT itself.
