@@ -115,8 +115,25 @@ class DeviceBridgeTests(unittest.TestCase):
 
     def test_status_never_trusts_nested_credentials(self):
         folder=self.mount/'.kindle-native-sync-export';folder.mkdir()
-        (folder/'status.json').write_text(json.dumps({'state':'collecting','collector':{'auth':self.auth},'error':'SYNTHETIC-ACCESS','validation':{'device_validation':False,'token':'SYNTHETIC-ACCESS'}}))
-        self.assertNotIn('SYNTHETIC-ACCESS',json.dumps(bridge.status(self.root,self.mount)))
+        (folder/'status.json').write_text(json.dumps({'state':'collecting','collector':{'auth':self.auth},'error':'SYNTHETIC-ACCESS','validation':{'device_validation':False,'token':'SYNTHETIC-ACCESS'},'capture':{'available':True,'reader_state':'idle','power_state':'awake','sealed_bytes':123,'sealed_files':1,'auth':self.auth}}))
+        (folder/'service-probe.json').write_text(json.dumps({'process_count':1,'total_rss_kib':123,'collector_running':True,'processes':[{'pid':3,'rss_kib':123,'role':'collector','cmdline':'SYNTHETIC-ACCESS'}],'auth':self.auth}))
+        value=bridge.status(self.root,self.mount)
+        self.assertNotIn('SYNTHETIC-ACCESS',json.dumps(value))
+        self.assertEqual(value['device_status']['capture']['sealed_bytes'],123)
+        self.assertEqual(value['service_probe']['processes'],[{'pid':3,'rss_kib':123,'role':'collector'}])
+
+    def test_worker_selftest_schema_is_visible_and_private_fields_are_redacted(self):
+        folder=self.mount/'.kindle-native-sync-export';folder.mkdir()
+        actual={'architecture':'arm','serial_prefix':'B0D4','supported_hardware':True,'supported_firmware':True,'kernel_release':'3.0.35-lab126','root':True,'auth':self.auth}
+        result={'schema_version':1,'actual_device':actual,'private_filesystem_ok':True,'network_contacted':False,'acceptance_created':False}
+        (folder/'selftest.json').write_text(json.dumps(result))
+        value=bridge.status(self.root,self.mount)['self_test']
+        self.assertTrue(value['actual_device']['supported_hardware']);self.assertEqual(value['actual_device']['serial_prefix'],'B0D4')
+        self.assertTrue(value['private_filesystem_ok']);self.assertFalse(value['acceptance_created'])
+        self.assertNotIn('SYNTHETIC-ACCESS',json.dumps(value))
+        actual['serial_prefix']='B0D4FULLSERIAL'
+        (folder/'selftest.json').write_text(json.dumps(result))
+        self.assertNotIn('FULLSERIAL',json.dumps(bridge.status(self.root,self.mount)))
 
     def test_package_verifier_rejects_host_or_dynamic_binaries(self):
         spec=importlib.util.spec_from_file_location('package_check',HERE/'device/build/package.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
@@ -269,6 +286,7 @@ printf '%s\n' "$value"
             except BlockingIOError:pass
             return all(item in b''.join(output) for item in (b'power awake\n',b'network 1\n',b'usb 0\n'))
         self.wait_for(complete)
+        self.assertTrue(b''.join(output).startswith(b'usb 1\npower sleeping\nnetwork 0\n'))
         self.assertEqual(self.process.pid,old_pid);self.assertIsNone(self.process.poll())
         self.assertEqual(len(self.queries()),before+4)
 
@@ -281,5 +299,123 @@ printf '%s\n' "$value"
         path.unlink();self.os.mkfifo(path,0o600);path.chmod(0o666)
         self.process=subprocess.Popen([str(self.binary),str(self.root),str(self.commands)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         self.assertEqual(self.process.wait(timeout=3),1)
+
+
+
+class BootstrapProbeTests(unittest.TestCase):
+    def setUp(self):
+        import os
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.base=Path(self.tmp.name);self.commands=self.base/'commands';self.commands.mkdir()
+        self.env={**os.environ,'PATH':str(self.commands)+':/bin:/usr/bin'}
+        self.package=self.base/'package';(self.package/'bin').mkdir(parents=True);(self.package/'install').mkdir()
+        self.out=self.base/'export';self.wifi=self.base/'wifi';self.wifi.write_text('CONNECTED\n')
+        self.command('id',"printf '0\\n'\n")
+        self.command('uname',"case \"$1\" in -m) printf 'armv7l\\n';; *) printf '3.0.35-lab126\\n';;esac\n")
+        self.command('df',"printf 'Filesystem 1024-blocks Used Available Capacity Mounted\\n/dev/test 65536 12345 50000 20%% /var/local\\n'\n")
+        self.command('date',"case \"$1\" in +%s) printf '1793578500\\n';; -u) printf '2026-11-02T00:15:00Z\\n';; *) printf '2026-11-02T08:15:00+0800\\n';;esac\n")
+        self.command('lipc-get-prop',"case \"$2\" in state) printf 'active\\n';; cmState) cat "+str(self.wifi)+";; driveModeState) printf '0\\n';; userstoreIsAvailable) printf '1\\n';; *) exit 1;;esac\n")
+        for name in ['initctl','lipc-wait-event','gzip','sha256sum','sync']:self.command(name,'exit 0\n')
+        private=self.base/'private';private.mkdir()
+        common=(HERE/'device/install/common.sh').read_text().replace('ROOT=/var/local/kindle-native-sync','ROOT='+str(private))
+        (self.package/'install/common.sh').write_text(common+'\nfirmware_ok() { return 0; }\n')
+        usid=self.base/'usid';usid.write_text('B0D4SYNTHETIC_FULL_SERIAL_NEVER_EXPORT')
+        mem=self.base/'meminfo';mem.write_text('MemTotal: 254652 kB\n')
+        mounts=self.base/'mounts';mounts.write_text('rootfs / rootfs rw 0 0\n/dev/root / ext3 ro,noatime 0 0\n')
+        probe=(HERE/'device/install/probe.sh').read_text().replace('/proc/usid',str(usid)).replace('/proc/meminfo',str(mem)).replace('/proc/mounts',str(mounts))
+        self.probe=self.package/'install/probe.sh';self.probe.write_text(probe)
+        bootstrap=(HERE/'device/kual/bootstrap.sh').read_text().replace('PATH=/sbin:/usr/sbin:/bin:/usr/bin','PATH='+str(self.commands)+':/bin:/usr/bin').replace('PACKAGE=/mnt/us/kindle-native-sync-package','PACKAGE='+str(self.package)).replace('OUT=/mnt/us/.kindle-native-sync-export','OUT='+str(self.out))
+        self.bootstrap=self.base/'bootstrap.sh';self.bootstrap.write_text(bootstrap)
+        self.calls=self.base/'worker-calls'
+        self.worker=self.package/'bin/ksync-worker'
+        self.worker.write_text('#!/bin/sh\nprintf \"%s\\n\" \"$*\" >> '+str(self.calls)+"\nprintf '{\"schema_version\":1,\"acceptance_created\":false}\\n'\n")
+        self.worker.chmod(0o700)
+
+    def command(self,name,body):
+        p=self.commands/name;p.write_text('#!/bin/sh\n'+body);p.chmod(0o700)
+
+    def run_bootstrap(self,action):
+        return subprocess.run(['sh',str(self.bootstrap),action],env=self.env,text=True,capture_output=True)
+
+    def test_readonly_probe_reports_budget_clock_states_without_full_serial(self):
+        r=subprocess.run(['sh',str(self.probe)],env=self.env,text=True,capture_output=True,check=True)
+        value=json.loads(r.stdout)
+        self.assertEqual((value['var_local_total_kib'],value['var_local_used_kib'],value['var_local_free_kib']),(65536,12345,50000))
+        self.assertTrue(value['hardware_supported']);self.assertTrue(value['supported']);self.assertTrue(value['installation_supported'])
+        self.assertEqual(value['mem_total_kib'],254652);self.assertEqual(value['root_mount_state'],'read_only')
+        self.assertEqual(value['clock_local'],'2026-11-02T08:15:00+0800');self.assertEqual(value['clock_utc'],'2026-11-02T00:15:00Z')
+        self.assertEqual(value['power_state'],'active');self.assertEqual(value['wifi_state'],'CONNECTED')
+        self.assertEqual(value['usb_drive_mode'],'0');self.assertEqual(value['userstore_available'],'1')
+        self.assertNotIn('SYNTHETIC_FULL_SERIAL',r.stdout)
+        self.command('lipc-get-prop',"printf 'unexpected\"secret\\n'\n")
+        r=subprocess.run(['sh',str(self.probe)],env=self.env,text=True,capture_output=True,check=True)
+        value=json.loads(r.stdout)
+        self.assertTrue(all(value[k]=='unknown' for k in ['power_state','wifi_state','usb_drive_mode','userstore_available']))
+        self.assertNotIn('secret',r.stdout)
+
+    def test_bootstrap_offline_and_explicit_online_flags_are_distinct(self):
+        r=self.run_bootstrap('self-test');self.assertEqual(r.returncode,0,r.stderr)
+        self.assertTrue((self.out/'selftest.json').is_file());self.assertNotIn('--online-self-test',self.calls.read_text())
+        self.assertFalse((self.out/'selftest.json.partial').exists())
+        r=self.run_bootstrap('tls-self-test');self.assertEqual(r.returncode,0,r.stderr)
+        self.assertTrue((self.out/'tls-selftest.json').is_file());self.assertIn('--online-self-test',self.calls.read_text())
+        self.assertFalse(json.loads((self.out/'tls-selftest.json').read_text())['acceptance_created'])
+        before=self.calls.read_text();self.wifi.write_text('NA\n')
+        r=self.run_bootstrap('tls-self-test');self.assertNotEqual(r.returncode,0)
+        self.assertEqual(self.calls.read_text(),before)
+        self.assertFalse(json.loads((self.out/'tls-selftest.json').read_text())['network_contacted'])
+
+    def test_candidate_failure_is_exported_without_raising_validation(self):
+        self.worker.write_text('#!/bin/sh\nexit 139\n')
+        r=self.run_bootstrap('self-test');self.assertEqual(r.returncode,0,r.stderr)
+        value=json.loads((self.out/'selftest.json').read_text())
+        self.assertEqual(value['worker_exit_code'],139);self.assertFalse(value['acceptance_created'])
+        self.assertFalse((self.out/'selftest.json.partial').exists())
+
+    def test_install_outcome_survives_reconnection_without_enabling_upload(self):
+        script=self.package/'install/install.sh'
+        for code,expected in [(0,'installed_collection_only'),(19,'installation_failed')]:
+            script.write_text('#!/bin/sh\nexit '+str(code)+'\n')
+            r=self.run_bootstrap('install');self.assertEqual(r.returncode,0,r.stderr)
+            value=json.loads((self.out/'install-result.json').read_text())
+            self.assertEqual(value['state'],expected);self.assertEqual(value['exit_code'],code)
+            self.assertFalse(value['auto_upload_enabled'])
+            self.assertFalse((self.out/'install-result.json.partial').exists())
+
+    def test_service_probe_covers_descendants_without_exporting_process_arguments(self):
+        proc=self.base/'proc';proc.mkdir();(proc/'uptime').write_text('1800.25 3.5\n')
+        for pid,parent,rss in [(10,1,100),(20,1,200),(30,20,300),(40,1,9999),(50,40,9999)]:
+            folder=proc/str(pid);folder.mkdir()
+            fields=[str(pid),'(synthetic process (safe))','S',str(parent)]+['0']*20
+            fields[13]='10';fields[14]='2';fields[21]='100'
+            (folder/'stat').write_text(' '.join(fields)+'\n')
+            (folder/'status').write_text('VmRSS: '+str(rss)+' kB\nPRIVATE_SYNTHETIC_ACCESS_TOKEN\n')
+            (folder/'cmdline').write_text('PRIVATE_SYNTHETIC_ACCESS_TOKEN')
+        self.command('initctl', 'case "$2" in kindle-native-sync) echo "job start/running, process 10";; *) echo "job start/running, process 20";;esac\n')
+        script=self.package/'install/service-probe.sh'
+        script.write_text((HERE/'device/install/service-probe.sh').read_text().replace('/proc/',str(proc)+'/'))
+        with (self.package/'install/common.sh').open('a') as f:f.write('\nrequire_device() { return 0; }\n')
+        r=subprocess.run(['sh',str(script)],env=self.env,text=True,capture_output=True,check=True)
+        value=json.loads(r.stdout)
+        self.assertEqual({p['pid'] for p in value['processes']},{10,20,30})
+        self.assertEqual(value['total_rss_kib'],600);self.assertEqual(value['process_count'],3)
+        self.assertTrue(value['rss_complete']);self.assertTrue(value['collector_running']);self.assertTrue(value['adapter_running'])
+        self.assertEqual(value['uptime_seconds'],1800);self.assertFalse(value['acceptance_created'])
+        self.assertNotIn('PRIVATE',r.stdout);self.assertTrue(all(p['cpu_ticks']==12 for p in value['processes']))
+
+    def test_low_space_worker_failure_still_exports_fresh_probe_and_service_state(self):
+        private=self.base/'private';(private/'bin').mkdir()
+        worker=private/'bin/ksync-worker';worker.write_text('#!/bin/sh\nexit 17\n');worker.chmod(0o700)
+        with (self.package/'install/common.sh').open('a') as f:f.write('\nrequire_device() { return 0; }\n')
+        for name in ('probe.sh','service-probe.sh'):
+            script=self.package/'install'/name;script.write_text('#!/bin/sh\necho \'{"schema_version":1,"fresh":true}\'\n');script.chmod(0o700)
+        control=self.package/'install/control.sh'
+        control.write_text((HERE/'device/install/control.sh').read_text().replace('out=/mnt/us/.kindle-native-sync-export','out='+str(self.out)))
+        subprocess.run(['sh',str(control),'export'],env=self.env,text=True,capture_output=True,check=True)
+        self.assertTrue(json.loads((self.out/'probe.json').read_text())['fresh'])
+        self.assertTrue(json.loads((self.out/'service-probe.json').read_text())['fresh'])
+        value=json.loads((self.out/'status.json').read_text())
+        self.assertEqual(value['state'],'worker_status_unavailable');self.assertEqual(value['worker_exit_code'],17)
+        self.assertFalse(value['auto_sync_enabled'])
 
 if __name__=='__main__':unittest.main()

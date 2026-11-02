@@ -317,7 +317,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
         metadata_bytes <= 4 * 1024 * 1024,
         "memory_budget_blocked: sealed input exceeds 4 MiB parse budget"
     );
-    storage_budget(&store.root, 16 * 1024 * 1024)?;
+    storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
     let mut proofs = Vec::new();
     let mut total = 0;
     for p in sources {
@@ -337,6 +337,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
             ensure!(prior == &hash, "sealed source changed; collect stopped");
         }
         if prior.is_none() {
+            storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
             let tx = store.db.unchecked_transaction()?;
             for line in String::from_utf8_lossy(&raw).lines() {
                 check_cancel()?;
@@ -505,6 +506,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
             blocked += 1
         }
         let body = json!({"id":id,"local_book_id":book.cde_key,"title":book.title,"day":day,"started_at":s.started_at,"ended_at":s.ended_at,"seconds":s.seconds,"hours":hours,"counter_evidence":identity,"clock_verified":true,"sources":proofs,"bootstrap_cutoff_unix":effective_cutoff,"book_version":0,"book_version_source":"unavailable"});
+        storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
         store.db.execute(
             "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)",
             params![
@@ -520,6 +522,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
         )?;
         inserted += 1;
     }
+    storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
     store.db.execute("INSERT INTO meta VALUES ('last_collect_blocked',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[blocked.to_string()])?;
     atomic_json(
         &store.root.join("collection-state.json"),

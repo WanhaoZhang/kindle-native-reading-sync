@@ -46,6 +46,7 @@ static char root[PATH_CAP] = "/var/local/kindle-native-sync",
 static char rotated_dir[PATH_CAP] = "/var/local/log";
 static char logdir[PATH_CAP], logbase[PATH_CAP], activepath[PATH_CAP],
     sealedpath[PATH_CAP], checkpoint[PATH_CAP], runtimepath[PATH_CAP];
+static int active_unsafe = 0;
 static int livefd = -1;
 static unsigned long long live_dev, live_ino;
 static int activefd = -1, controlfd = -1, lockfd = -1, poll_ms = 0,
@@ -53,9 +54,11 @@ static int activefd = -1, controlfd = -1, lockfd = -1, poll_ms = 0,
            reading_live = 1;
 static long long bootstrap, idle_since, last_sync, active_committed,
     idle_mono_ms;
-static unsigned long long queue_max = 16 * 1024 * 1024,
-                          reserve_min = 20 * 1024 * 1024, queue_cached,
-                          free_cached;
+/* PW2 /var/local is about 62 MiB. Keep 20 MiB for the system plus a
+   separate 4 MiB allowance for the worker's bounded SQLite transaction. */
+static unsigned long long queue_max = 4 * 1024 * 1024,
+                          reserve_min = 24 * 1024 * 1024 + 64 * 1024,
+                          queue_cached, free_cached;
 static long long room_checked, gzip_due_ms;
 static char reader[16] = "unknown", power[16] = "unknown";
 static int usb = 0, net = 0, ever_opened = 0, booklet_stopping = 0;
@@ -101,20 +104,73 @@ static void fsyncdir(const char *p) {
     close(fd);
   }
 }
+/* Best-effort private-filesystem guard. Other firmware writers are concurrent;
+ * fresh checks are a floor, not an exclusive reservation of filesystem blocks.
+ */
+static void storage_blocked(void) {
+  if (!blocked) {
+    blocked = 1;
+    if (worker > 0)
+      kill(worker, SIGTERM);
+  }
+}
+static int fresh_space(size_t extra, unsigned long long floor,
+                       unsigned long long overhead) {
+  struct statvfs v;
+  if (statvfs(root, &v) || !v.f_bsize || !v.f_frsize) {
+    storage_blocked();
+    return 0;
+  }
+  unsigned long long block = (unsigned long long)v.f_bsize;
+  unsigned long long fragments = (unsigned long long)v.f_bavail;
+  unsigned long long unit = (unsigned long long)v.f_frsize;
+  if (fragments > ULLONG_MAX / unit ||
+      (unsigned long long)extra > ULLONG_MAX - (block - 1)) {
+    errno = EOVERFLOW;
+    storage_blocked();
+    return 0;
+  }
+  unsigned long long rounded =
+      ((unsigned long long)extra + block - 1) / block * block;
+  if (floor > ULLONG_MAX - overhead ||
+      rounded > ULLONG_MAX - floor - overhead) {
+    errno = EOVERFLOW;
+    storage_blocked();
+    return 0;
+  }
+  free_cached = fragments * unit;
+  if (free_cached < floor + overhead + rounded) {
+    errno = ENOSPC;
+    storage_blocked();
+    return 0;
+  }
+  return 1;
+}
 static int atomic_text(const char *path, const char *text) {
+  /* A failure/status record must remain writable below the ordinary 24 MiB
+   * capture threshold, but may not spend the system's 20 MiB safety floor. */
+  size_t n = strlen(text);
+  if (!fresh_space(n, 20ULL * 1024 * 1024, 64ULL * 1024))
+    return -1;
   char tmp[PATH_CAP];
   if (snprintf(tmp, sizeof tmp, "%s.tmp-%ld", path, (long)getpid()) >=
-      (int)sizeof tmp)
+      (int)sizeof tmp) {
+    errno = ENAMETOOLONG;
+    storage_blocked();
     return -1;
+  }
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-  if (fd < 0)
+  if (fd < 0) {
+    storage_blocked();
     return -1;
-  size_t n = strlen(text), at = 0;
+  }
+  size_t at = 0;
   while (at < n) {
     ssize_t w = write(fd, text + at, n - at);
     if (w <= 0) {
       close(fd);
       unlink(tmp);
+      storage_blocked();
       return -1;
     }
     at += (size_t)w;
@@ -124,9 +180,10 @@ static int atomic_text(const char *path, const char *text) {
     bad = -1;
   if (!bad && rename(tmp, path))
     bad = -1;
-  if (bad)
+  if (bad) {
     unlink(tmp);
-  else
+    storage_blocked();
+  } else
     fsyncdir(root);
   return bad;
 }
@@ -197,16 +254,22 @@ static unsigned long long queue_bytes(void) {
   return n;
 }
 static int room(size_t extra) {
-  if (!room_checked || nowsec() - room_checked >= 30) {
-    struct statvfs v;
-    if (statvfs(root, &v))
-      return 0;
-    free_cached = (unsigned long long)v.f_bavail * v.f_frsize;
+  /* Only the directory walk is cached. Firmware and the worker can consume
+   * blocks between consecutive input lines, even inside one 30-second pass. */
+  if (!fresh_space(extra, reserve_min, 0))
+    return 0;
+  if (!room_checked || nowsec() < room_checked ||
+      nowsec() - room_checked >= 30) {
     queue_cached = queue_bytes();
     room_checked = nowsec();
   }
-  return free_cached >= reserve_min + extra &&
-         queue_cached + extra <= queue_max;
+  if ((unsigned long long)extra > queue_max ||
+      queue_cached > queue_max - extra) {
+    errno = ENOSPC;
+    storage_blocked();
+    return 0;
+  }
+  return 1;
 }
 static int active_open(void) {
   if (activefd >= 0)
@@ -215,14 +278,23 @@ static int active_open(void) {
   return activefd < 0 ? -1 : 0;
 }
 static int save(void) {
-  if (activefd >= 0 && fsync(activefd))
+  if (active_unsafe) {
+    errno = EIO;
+    storage_blocked();
     return -1;
+  }
+  if (activefd >= 0 && fsync(activefd)) {
+    storage_blocked();
+    return -1;
+  }
   struct stat s;
   active_committed = (!stat(activepath, &s) ? s.st_size : 0);
   size_t cap = 256 + (size_t)nc * (PATH_CAP + 100);
   char *b = calloc(1, cap);
-  if (!b)
+  if (!b) {
+    storage_blocked();
     return -1;
+  }
   size_t at =
       (size_t)snprintf(b, cap, "KSYNC1 %lld %lld %lld %d %d %s %s %d %d\n",
                        bootstrap, idle_since, active_committed, ever_opened,
@@ -231,6 +303,12 @@ static int save(void) {
     at += (size_t)snprintf(b + at, cap - at, "%llu %llu %llu %llu %d %s\n",
                            curs[i].dev, curs[i].ino, curs[i].off - curs[i].len,
                            curs[i].gz_size, curs[i].gz_done, curs[i].path);
+  /* A normal checkpoint must not borrow the worker's rollback scratch. Only
+   * the small emergency runtime marker may use atomic_text's lower floor. */
+  if (!fresh_space(strlen(b), reserve_min, 0)) {
+    free(b);
+    return -1;
+  }
   int r = atomic_text(checkpoint, b);
   free(b);
   if (!r) {
@@ -241,7 +319,7 @@ static int save(void) {
 }
 static void seal(void) {
   if (save()) {
-    blocked = 1;
+    storage_blocked();
     runtime();
     return;
   }
@@ -257,7 +335,7 @@ static void seal(void) {
            (long)getpid(), serialno++);
   join(dest, sealedpath, name);
   if (rename(activepath, dest)) {
-    blocked = 1;
+    storage_blocked();
     runtime();
     return;
   }
@@ -267,7 +345,7 @@ static void seal(void) {
   fsyncdir(ev);
   active_committed = 0;
   if (save()) {
-    blocked = 1;
+    storage_blocked();
     runtime();
   }
 }
@@ -285,7 +363,7 @@ static struct cursor *add_cursor(const char *p, const struct stat *s,
     return c;
   if (nc == MAX_CURSORS) {
     mark_gap();
-    blocked = 1;
+    storage_blocked();
     return NULL;
   }
   c = &curs[nc++];
@@ -363,17 +441,35 @@ static int process_line(const char *line, size_t n) {
   /* After a witnessed post-bootstrap open, retain late timer lines too; their
    * event timestamps remain unchanged. */
   if (!room(n)) {
-    blocked = 1;
+    storage_blocked();
     runtime();
     return -1;
   }
-  if (active_open())
+  if (active_open()) {
+    storage_blocked();
+    runtime();
     return -1;
+  }
+  off_t begin = lseek(activefd, 0, SEEK_END);
+  if (begin < 0) {
+    storage_blocked();
+    runtime();
+    return -1;
+  }
   size_t at = 0;
   while (at < n) {
     ssize_t w = write(activefd, line + at, n - at);
-    if (w <= 0)
+    if (w <= 0) {
+      int failure = errno;
+      if (ftruncate(activefd, begin)) {
+        active_unsafe = 1;
+        mark_gap();
+      }
+      storage_blocked();
+      runtime();
+      errno = failure;
       return -1;
+    }
     at += (size_t)w;
   }
   queue_cached += n;
@@ -421,7 +517,7 @@ static int ensure_part(struct cursor *c, size_t need) {
     cap = LINE_CAP;
   char *buf = realloc(c->part, cap);
   if (!buf) {
-    blocked = 1;
+    storage_blocked();
     runtime();
     return -1;
   }
@@ -588,7 +684,7 @@ static void scan_file(const char *p, int first) {
   if (reading_live) {
     if (livefd >= 0 && (live_dev != c->dev || live_ino != c->ino)) {
       if (dirty && save()) {
-        blocked = 1;
+        storage_blocked();
         runtime();
         close(fd);
         return;
@@ -682,7 +778,7 @@ static void scan_all(int first) {
       if (curs[i].len || curs[i].discard)
         mark_gap();
       if (dirty && save()) {
-        blocked = 1;
+        storage_blocked();
         runtime();
         return;
       }
@@ -694,7 +790,7 @@ static void scan_all(int first) {
       i++;
   }
   if (removed && save()) {
-    blocked = 1;
+    storage_blocked();
     runtime();
   }
 }
@@ -969,7 +1065,7 @@ int main(int argc, char **argv) {
   while (!stopping) {
     int timeout = -1;
     long long n = monotonic_ms();
-    if (dirty)
+    if (dirty && !blocked)
       timeout = (int)(last_sync + 30000 - n);
     if (!strcmp(reader, "idle") &&
         strcmp(last_worker_mode, net ? "sync" : "collect") &&
@@ -989,7 +1085,7 @@ int main(int argc, char **argv) {
       timeout = 1000;
     if (poll_ms && (timeout < 0 || timeout > poll_ms))
       timeout = poll_ms;
-    if (timeout < 0 && dirty)
+    if (timeout < 0 && dirty && !blocked)
       timeout = 0;
     struct pollfd fds[2] = {{controlfd, POLLIN, 0}, {notifyfd, POLLIN, 0}};
     int r = poll(fds, notifyfd >= 0 ? 2 : 1, timeout);
@@ -997,6 +1093,7 @@ int main(int argc, char **argv) {
       break;
     if (stopping)
       break;
+    int was_blocked = blocked;
     if (fds[0].revents & POLLIN)
       controls();
     int changed = poll_ms > 0 || (fds[0].revents & POLLIN);
@@ -1026,8 +1123,16 @@ int main(int argc, char **argv) {
       if (was_active && !strcmp(reader, "idle") && !blocked)
         scan_dir(rotated_dir, 0);
     }
-    if (dirty && monotonic_ms() >= last_sync + 30000)
-      save();
+    if (blocked && !was_blocked) {
+      /* One bounded durability attempt after the failed line has been rewound;
+       * never turn a persistent low-space condition into a zero-timeout loop.
+       */
+      (void)save();
+      runtime();
+    } else if (dirty && !blocked && monotonic_ms() >= last_sync + 30000) {
+      if (save())
+        runtime();
+    }
     maybe_worker();
   }
   cancel_worker();

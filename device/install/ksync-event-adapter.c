@@ -84,6 +84,9 @@ static int control_channel(void){
     return fd;
 }
 static void forced_snapshot(void){
+    /* One atomic fail-closed barrier before any slow property query. A worker
+       must never mistake the first safe field for a complete refreshed snapshot. */
+    if(emit("usb 1\npower sleeping\nnetwork 0\n"))return;
     power_state=-1;network_state=-1;usb_state=-1;
     refresh_all();
 }

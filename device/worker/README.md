@@ -27,9 +27,11 @@ ksync-worker --root DIR compact
 ksync-worker --root DIR reconcile --plan-id PLAN_ID
 ```
 
-`self-test` 默认仅探测实际架构、B0D4 硬件前缀、固件、内核和私有原子文件读写，**不会联网或生成验收证书**。显式 `--online-self-test` 才向固定的 `https://i.weread.qq.com/config` 匿名 GET 一次，保留标准 CA/主机名校验，不读取或发送账号凭据。
+`self-test` 默认仅探测实际架构、B0D4 硬件前缀（对 `/proc/usid` 严格只读取 4 字节，不读取完整序列号）、固件、内核和私有原子文件读写，**不会联网或生成验收证书**。显式 `--online-self-test` 才向固定的 `https://i.weread.qq.com/config` 匿名 GET 一次，保留标准 CA/主机名校验，不读取或发送账号凭据。
 
 `collect` 需要 runtime 新鲜（120 秒以内）、reader idle 20 秒、设备 awake、非 USB 导出、capture 未阻断；不要求联网。`sync` 额外要求联网且不存在待人工核验的 capture gap。所有未知状态、缺字段、未来时间均阻断。重启后的 bootstrap 与 Mac handoff cutoff 取较晚值，避免导入首次安装以前的数据。未配置时 raw journal 仍由 collector 保留，worker 返回 `collect_only_unconfigured`，不会尝试账号请求。
+
+手动 trial 的 prepare/confirm 与 `reconcile` 若发现 runtime 已超过 120 秒，会先向私有 `adapter-control.fifo` 非阻塞请求 `refresh`，核验 FIFO 类型、属主、0600 权限和打开前后 inode/device 一致，再等待 collector 真正更新 runtime；不 touch 文件或改写状态。总等待最多 6 秒，真实快照过程中短暂不安全状态最多等待 2 秒，最后仍必须通过同一 gate。reader active/unknown、无 adapter reader、符号链接或宽松权限均继续阻断。自动 sync 仍使用 collector 启动前刷新机制，不新增轮询或网络行为。
 
 ## 配置、认证和交接
 
@@ -44,6 +46,8 @@ ksync-worker --root DIR reconcile --plan-id PLAN_ID
 ```
 
 worker 检查文件 hash、账号和设备一致，原子保存到私有 root。交接配置中的两个验收开关必须都是 false。成功后仅删除已验证的三份交接文件，若 inbox 为空才删除目录，不删除额外用户文件。导入失败不清除凭据供调查；应在 USB 用户区上及时人工清理失败交接的凭据。身份、账号或 bootstrap 不能覆盖已有账本。
+
+`status.capture` 只提供已枚举的 runtime 状态和 `active_bytes/sealed_bytes/sealed_files` 数字，便于尚未配置账号时验证采集链路，不读取日志正文或认证数据。runtime 缺失、权限/类型不安全或状态枚举非法时 `available=false`；该快照不是设备验收证据。
 
 ## 两项验收和受控试传
 
@@ -81,10 +85,12 @@ counter 范围重叠默认阻断；OpenBook 的整秒 TimeRead 可能造成不�
 
 ## 空间、内存与 compact
 
-SQLite `page_size=4096,max_page_count=4096`，明确限制为 16 MiB。heavy collect/commit/compact 前要求文件系统至少保留 20 MiB，加 16 MiB 本次事务/rollback 预算；不足返回 `storage_blocked`，不删除未确认数据。
+PW2 统一存储 profile：SQLite `page_size=4096,max_page_count=1024`，账本硬上限 **4 MiB**。`Store::open`/schema 初始化、每个 collect/prepare/claim/receipt/reconcile/compact 的写事务前，均重新检查真实可用块：至少保留 **20 MiB 系统 free + 4 MiB 例行事务/rollback + 64 KiB 元数据与分配对齐余量**。JSON 原子替换另外按新临时文件实际字节预算，再保留相同系统与元数据余量。已有超过 4 MiB 的账本会被保留并拒绝修改，不截断或自动重建。
+
+保持 `journal_mode=DELETE,synchronous=FULL`，关闭 cache spilling，避免大型事务中间溢写造成额外 journal 分段；SQLite 临时排序放内存，受账本和输入窗口上限约束。若 POST 之后系统空间不足以安全写回确认，保留已 claim 的 dispatching 账本，不通过重发来“修复”。Collector 应使用同一 4 MiB raw 队列与 24 MiB+64 KiB free 阈值，并在 append 前读取实时 free，不能沿用过时的 worker 写入前 free 缓存。
 
 一次解析的封存 raw journal 和 raw line ledger 上限为 4 MiB，超过返回 `memory_budget_blocked` 并保留源文件。SQLite 逐行分类，不构建多份完整正文；**worker 真机峰值 RSS/翻页延迟仍未实测**，4 MiB 输入限制不是内存占用保证。
 
-`compact` 仅在最近一次解析没有任何无法关联/时区不明/冲突数据、所有 sessions 与 attempts 都 confirmed、来源 hash 均可核验时执行。事务清理 raw lines/sources，归档源 hash，保留会话 ID、counter 范围、日统计和上传回执，再仅删除这些已确认的 sealed 日志并 VACUUM。活动日志不碰；任何未确认或无法解释的片段都会阻断清理。自动 sync 成功后也会尝试该保守清理，受新一轮 runtime/取消检查约束。
+`compact` 仅在最近一次解析没有任何无法关联/时区不明/冲突数据、所有 sessions 与 attempts 都 confirmed、来源 hash 均可核验时执行。事务清理 raw lines/sources，归档源 hash，保留会话 ID、counter 范围、日统计和上传回执，再仅删除这些已确认的 sealed 日志。**默认不执行 VACUUM，也不缩小 SQLite 文件**；腾出的页面会在 4 MiB 文件内复用。VACUUM 可能另需约两份当前数据库的临时空间，不能用例行 4 MiB 预算覆盖；本版不提供未暂停 collector 的 maintenance vacuum。活动日志不碰；任何未确认或无法解释的片段都会阻断清理。自动 sync 成功后也会尝试该保守清理，受新一轮 runtime/取消检查约束。
 
 无法安全 compact 时应导出、人工诊断，不能删除 ledger 重新开始。即使 compact 后原始日志的重复复制件再次出现，保留的 ID 和 counter 范围也能阻断重复上传。

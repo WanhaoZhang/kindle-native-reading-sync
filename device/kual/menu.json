@@ -5,6 +5,14 @@
       "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh probe"
     },
     {
+      "name": "Run local candidate self-test (no network)",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh self-test"
+    },
+    {
+      "name": "Run candidate TLS probe (explicit network)",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh tls-self-test"
+    },
+    {
       "name": "Install / upgrade (collection only)",
       "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh install"
     },

@@ -1,5 +1,6 @@
 //! One-shot device worker. No UI, no background thread, no wake/Wi-Fi control.
 //! SPDX-License-Identifier: AGPL-3.0-only
+pub mod manual;
 pub mod network;
 pub mod parsing;
 pub mod protocol;
@@ -44,6 +45,7 @@ extern "C" fn cancel_signal(_: libc::c_int) {
 }
 pub fn install_signal_handlers() {
     unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         libc::signal(libc::SIGTERM, cancel_signal as libc::sighandler_t);
         libc::signal(libc::SIGINT, cancel_signal as libc::sighandler_t);
     }
@@ -87,8 +89,51 @@ pub fn private_json(path: &Path) -> Result<Value> {
     );
     Ok(serde_json::from_slice(&limited(path, 1024 * 1024)?)?)
 }
+pub const SYSTEM_RESERVE_BYTES: u64 = 20 * 1024 * 1024;
+pub const ROUTINE_TRANSACTION_BYTES: u64 = 4 * 1024 * 1024;
+pub const LEDGER_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
+pub const LEDGER_MAX_PAGES: i64 = 1024;
+pub const STORAGE_METADATA_MARGIN: u64 = 64 * 1024;
+
+fn existing_storage_ancestor(path: &Path) -> Result<&Path> {
+    let mut at = path;
+    while !at.exists() {
+        at = at
+            .parent()
+            .context("storage_blocked: no existing filesystem ancestor")?;
+    }
+    Ok(at)
+}
+pub fn required_free_bytes(transaction_bytes: u64, block: u64) -> Result<u64> {
+    ensure!(
+        block > 0,
+        "storage_blocked: invalid filesystem allocation unit"
+    );
+    let raw = SYSTEM_RESERVE_BYTES
+        .checked_add(transaction_bytes)
+        .and_then(|n| n.checked_add(STORAGE_METADATA_MARGIN))
+        .context("storage_blocked: budget overflow")?;
+    let rounded = raw
+        .checked_add(block - 1)
+        .context("storage_blocked: budget overflow")?
+        / block;
+    rounded
+        .checked_mul(block)
+        .context("storage_blocked: budget overflow")
+}
+pub fn check_available_bytes(free: u64, transaction_bytes: u64, block: u64) -> Result<()> {
+    ensure!(
+        free >= required_free_bytes(transaction_bytes, block)?,
+        "storage_blocked: private filesystem reserve"
+    );
+    Ok(())
+}
 pub fn atomic_json(path: &Path, v: &Value) -> Result<()> {
     let parent = path.parent().context("no parent")?;
+    let bytes = serde_json::to_vec_pretty(v)?;
+    // Existing target bytes are already charged in statvfs. Budget the new
+    // complete temporary, so atomic replacement cannot consume the OS reserve.
+    storage_budget(existing_storage_ancestor(parent)?, bytes.len() as u64)?;
     fs::create_dir_all(parent)?;
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     let mut f = fs::OpenOptions::new()
@@ -98,7 +143,7 @@ pub fn atomic_json(path: &Path, v: &Value) -> Result<()> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp)?;
     let result = (|| {
-        f.write_all(&serde_json::to_vec_pretty(v)?)?;
+        f.write_all(&bytes)?;
         f.sync_all()?;
         fs::rename(&tmp, path)?;
         fs::File::open(parent)?.sync_all()?;
@@ -109,23 +154,26 @@ pub fn atomic_json(path: &Path, v: &Value) -> Result<()> {
     }
     result
 }
-/// Budget includes room for a bounded rollback journal/transaction, not just payload bytes.
+/// Every write is admitted against real free blocks. The C collector uses the
+/// same 20MiB OS reserve plus 4MiB worker scratch and a 64KiB metadata margin.
 pub fn storage_budget(root: &Path, transaction_bytes: u64) -> Result<()> {
     use std::ffi::CString;
-    let path = CString::new(root.as_os_str().as_encoded_bytes())?;
+    let path = CString::new(
+        existing_storage_ancestor(root)?
+            .as_os_str()
+            .as_encoded_bytes(),
+    )?;
     let mut v = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     ensure!(
         unsafe { libc::statvfs(path.as_ptr(), v.as_mut_ptr()) } == 0,
         "storage_blocked: cannot inspect private filesystem"
     );
     let v = unsafe { v.assume_init() };
-    let free = (v.f_bavail as u64).saturating_mul(v.f_frsize as u64);
-    ensure!(
-        free >= 20 * 1024 * 1024 + transaction_bytes,
-        "storage_blocked: private filesystem reserve"
-    );
-    Ok(())
+    let block = (v.f_frsize as u64).max(1);
+    let free = (v.f_bavail as u64).saturating_mul(block);
+    check_available_bytes(free, transaction_bytes, block)
 }
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Runtime {
     pub schema_version: u32,
@@ -270,6 +318,95 @@ impl Auth {
     }
 }
 
+/// Diagnostic snapshot only: state JSON plus stat sizes, never raw log content.
+pub fn capture_diagnostics(root: &Path) -> Value {
+    let mut out = json!({"available":false});
+    let counts = (|| -> Result<(u64, u64, u64)> {
+        let events = root.join("events");
+        let md = fs::symlink_metadata(&events)?;
+        ensure!(
+            md.is_dir() && !md.file_type().is_symlink(),
+            "unsafe capture directory"
+        );
+        let active = events.join("active.log");
+        let active_bytes = match fs::symlink_metadata(&active) {
+            Ok(m) => {
+                ensure!(
+                    m.is_file() && !m.file_type().is_symlink(),
+                    "unsafe active capture file"
+                );
+                m.len()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e.into()),
+        };
+        let sealed = events.join("sealed");
+        let m = fs::symlink_metadata(&sealed)?;
+        ensure!(
+            m.is_dir() && !m.file_type().is_symlink(),
+            "unsafe sealed capture directory"
+        );
+        let (mut bytes, mut files) = (0u64, 0u64);
+        for entry in fs::read_dir(sealed)? {
+            let p = entry?.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("log") {
+                continue;
+            }
+            let m = fs::symlink_metadata(&p)?;
+            ensure!(
+                m.is_file() && !m.file_type().is_symlink(),
+                "unsafe sealed capture file"
+            );
+            bytes = bytes
+                .checked_add(m.len())
+                .context("capture size overflow")?;
+            files += 1;
+        }
+        Ok((active_bytes, bytes, files))
+    })();
+    if let Ok((active, sealed, files)) = counts {
+        out["active_bytes"] = json!(active);
+        out["sealed_bytes"] = json!(sealed);
+        out["sealed_files"] = json!(files);
+    } else {
+        return out;
+    }
+    let runtime = (|| -> Result<Runtime> {
+        let p = root.join("runtime.json");
+        let md = fs::symlink_metadata(&p)?;
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            md.is_file()
+                && !md.file_type().is_symlink()
+                && md.uid() == unsafe { libc::geteuid() }
+                && (md.mode() & 0o077) == 0,
+            "unsafe runtime diagnostic"
+        );
+        let r: Runtime = serde_json::from_slice(&limited(&p, 16384)?)?;
+        ensure!(
+            r.schema_version == 1
+                && ["active", "idle", "unknown"].contains(&r.reader_state.as_str())
+                && ["awake", "sleeping", "unknown"].contains(&r.power_state.as_str())
+                && r.bootstrap_unix >= 0
+                && r.idle_since_unix >= 0,
+            "invalid capture state"
+        );
+        Ok(r)
+    })();
+    if let Ok(r) = runtime {
+        out["available"] = json!(true);
+        out["reader_state"] = json!(r.reader_state);
+        out["power_state"] = json!(r.power_state);
+        out["usb_export"] = json!(r.usb_export);
+        out["network_connected"] = json!(r.network_connected);
+        out["capture_blocked"] = json!(r.capture_blocked);
+        out["coverage_gap"] = json!(r.coverage_gap);
+        out["bootstrap_unix"] = json!(r.bootstrap_unix);
+        out["idle_since_unix"] = json!(r.idle_since_unix);
+    }
+    out
+}
+
 pub struct Store {
     pub root: PathBuf,
     pub db: Connection,
@@ -277,6 +414,7 @@ pub struct Store {
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
+        storage_budget(root, ROUTINE_TRANSACTION_BYTES)?;
         if !root.exists() {
             fs::create_dir_all(root)?;
             fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
@@ -306,10 +444,21 @@ impl Store {
                 "unsafe ledger path"
             );
         }
+        if path.exists() {
+            ensure!(
+                fs::metadata(&path)?.len() <= LEDGER_LIMIT_BYTES,
+                "storage_blocked: existing ledger exceeds PW2 4MiB profile; never truncate it"
+            );
+        }
         let db = Connection::open(&path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        db.execute_batch("PRAGMA page_size=4096;PRAGMA max_page_count=4096;PRAGMA journal_mode=DELETE;PRAGMA synchronous=FULL;PRAGMA busy_timeout=1000;
-   CREATE TABLE IF NOT EXISTS sources(path TEXT PRIMARY KEY,hash TEXT NOT NULL);
+        db.execute_batch("PRAGMA page_size=4096;PRAGMA max_page_count=1024;PRAGMA journal_mode=DELETE;PRAGMA synchronous=FULL;PRAGMA busy_timeout=1000;PRAGMA cache_spill=OFF;PRAGMA temp_store=MEMORY;")?;
+        let page_size: i64 = db.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        ensure!(
+            page_size == 4096,
+            "storage_blocked: existing ledger has incompatible page size; never rebuild it"
+        );
+        db.execute_batch("CREATE TABLE IF NOT EXISTS sources(path TEXT PRIMARY KEY,hash TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS compacted_sources(path TEXT PRIMARY KEY,hash TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS lines(hash TEXT PRIMARY KEY,line TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,book TEXT NOT NULL,day TEXT NOT NULL,start_ms INTEGER,end_ms INTEGER,extent INTEGER,state TEXT NOT NULL,body TEXT NOT NULL);
@@ -320,8 +469,8 @@ impl Store {
    CREATE INDEX IF NOT EXISTS session_book_state ON sessions(book,state,day);")?;
         let pages: i64 = db.query_row("PRAGMA page_count", [], |r| r.get(0))?;
         ensure!(
-            pages <= 4096,
-            "storage_blocked: ledger exceeds 16 MiB limit"
+            pages <= LEDGER_MAX_PAGES,
+            "storage_blocked: ledger exceeds 4 MiB PW2 limit"
         );
         Ok(Self {
             root: root.to_owned(),
@@ -350,6 +499,7 @@ impl Store {
                 "cannot replace installation/account/bootstrap ledger identity"
             );
         } else {
+            storage_budget(&self.root, ROUTINE_TRANSACTION_BYTES)?;
             self.db
                 .execute("INSERT INTO meta VALUES ('identity',?)", [identity])?;
         }
@@ -387,6 +537,7 @@ impl Store {
             .db
             .query_row("SELECT count(*) FROM attempts", [], |r| r.get(0))?;
         let mut out = json!({"schema_version":1,"state":"unconfigured","configured":false,"authenticated":false,"states":states,"attempts":attempts,"pending_seconds":pending,"confirmed_seconds":confirmed,"unknown_batches":unknown,"collect_only_default":true,"auto_sync_enabled":false,"validation":{"device_validation":false,"protocol_validation":false}});
+        out["capture"] = capture_diagnostics(&self.root);
         match Config::load(&self.root) {
             Ok(c) => {
                 let binding = c.binding()?;
@@ -463,6 +614,13 @@ pub fn import_config(store: &Store, inbox: &Path) -> Result<Value> {
     }
     Ok(json!({"state":"imported","auto_sync_enabled":false}))
 }
+/// The file reader is deliberately unbuffered: procfs never supplies more than
+/// four requested bytes to this helper, and the remaining serial is not read.
+fn model_prefix(mut reader: impl std::io::Read) -> Result<String> {
+    let mut prefix = [0u8; 4];
+    reader.read_exact(&mut prefix)?;
+    Ok(std::str::from_utf8(&prefix)?.to_owned())
+}
 pub fn actual_device() -> Value {
     let firmware = [
         "/etc/prettyversion.txt",
@@ -479,9 +637,9 @@ pub fn actual_device() -> Value {
         .unwrap_or_default()
         .trim()
         .to_owned();
-    let prefix = fs::read_to_string("/proc/usid")
+    let prefix = fs::File::open("/proc/usid")
         .ok()
-        .map(|s| s.chars().take(4).collect::<String>())
+        .and_then(|file| model_prefix(file).ok())
         .unwrap_or_default();
     json!({"architecture":std::env::consts::ARCH,"serial_prefix":prefix,"supported_hardware":prefix=="B0D4","supported_firmware":firmware.is_some(),"kernel_release":kernel,"root":unsafe{libc::geteuid()}==0})
 }
@@ -681,6 +839,7 @@ pub fn prepare(store: &Store, book: Option<&str>, trial: bool, max_seconds: i64)
     let mut plan = json!({"schema_version":1,"created_unix":now(),"trial":trial,"binding_sha256":c.binding()?,"account_hash":c.account_hash(),"local_book_id":local,"weread_book_id":mapping.weread_book_id,"title":mapping.title,"day":day,"seconds":seconds,"hours":hours,"sessions":chosen});
     let id = sha(plan.to_string());
     plan["plan_id"] = json!(id);
+    storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
     store.db.execute(
         "INSERT OR IGNORE INTO plans VALUES (?,'prepared',?)",
         params![id, plan.to_string()],
@@ -733,7 +892,7 @@ pub fn commit_verified<T: network::Transport>(
     trial: bool,
     transport: &mut T,
 ) -> Result<Value> {
-    storage_budget(&store.root, 16 * 1024 * 1024)?;
+    storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
     let c = Config::load(&store.root)?;
     store.bind(&c)?;
     let mut a = Auth::load(&store.root, &c)?;
@@ -825,6 +984,7 @@ pub fn commit_verified<T: network::Transport>(
     verify_plan(store, &c, &plan, trial)?;
     // The durable claim is the at-most-once boundary. No network request follows a failed claim.
     check_cancel()?;
+    storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
     let tx = store.db.unchecked_transaction()?;
     let changed = tx.execute(
         "UPDATE plans SET state='dispatching' WHERE id=? AND state='prepared'",
@@ -885,6 +1045,7 @@ pub fn commit_verified<T: network::Transport>(
         }
     }
     let receipt = json!({"plan_id":id,"state":state,"acknowledged":ack,"seconds":plan["seconds"],"before":before,"after":after,"day_before":day_before,"day_after":day_after,"replay_allowed":false});
+    storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
     let tx = store.db.unchecked_transaction()?;
     tx.execute(
         "UPDATE attempts SET state=?,body=? WHERE id=?",
@@ -1424,12 +1585,12 @@ mod tests {
         assert_eq!(m.calls.len(), before);
     }
     #[test]
-    fn database_has_explicit_sixteen_mib_ceiling() {
+    fn database_has_explicit_four_mib_ceiling() {
         let (_t, s, _) = fixture();
         assert_eq!(
             s.db.query_row("PRAGMA max_page_count", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            4096
+            1024
         );
         assert_eq!(
             s.db.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))
@@ -1497,6 +1658,151 @@ mod tests {
             )
             .unwrap(),
             1
+        );
+    }
+    #[test]
+    fn model_prefix_reads_exactly_four_bytes_without_reading_serial_tail() {
+        struct Tracked {
+            position: usize,
+        }
+        impl std::io::Read for Tracked {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(buf.len() <= 4);
+                let source = b"B0D4SYNTHETIC-PRIVATE-TAIL";
+                let n = buf.len().min(source.len() - self.position);
+                buf[..n].copy_from_slice(&source[self.position..self.position + n]);
+                self.position += n;
+                Ok(n)
+            }
+        }
+        let mut input = Tracked { position: 0 };
+        assert_eq!(model_prefix(&mut input).unwrap(), "B0D4");
+        assert_eq!(input.position, 4);
+    }
+    #[test]
+    fn storage_profile_boundaries_include_journal_and_metadata_margin() {
+        let required = required_free_bytes(ROUTINE_TRANSACTION_BYTES, 4096).unwrap();
+        assert_eq!(required, 24 * 1024 * 1024 + 64 * 1024);
+        assert!(check_available_bytes(required, ROUTINE_TRANSACTION_BYTES, 4096).is_ok());
+        assert!(check_available_bytes(required - 1, ROUTINE_TRANSACTION_BYTES, 4096).is_err());
+        assert!(required_free_bytes(u64::MAX, 4096).is_err());
+        assert!(required_free_bytes(1, 0).is_err());
+    }
+    #[test]
+    fn diagnostics_report_capture_bytes_without_reading_log_contents() {
+        let (_t, s, _) = fixture();
+        let active = s.root.join("events/active.log");
+        let f = fs::File::create(&active).unwrap();
+        f.set_len(12345).unwrap();
+        let out = capture_diagnostics(&s.root);
+        assert_eq!(out["available"], true);
+        assert_eq!(out["active_bytes"], 12345);
+        assert_eq!(out["sealed_files"], 1);
+        assert_eq!(out["sealed_bytes"], 27);
+        assert_eq!(out["reader_state"], "idle");
+        assert!(!out.to_string().contains("synthetic counted evidence"));
+    }
+    #[test]
+    fn diagnostics_fail_closed_for_missing_or_unsafe_runtime() {
+        let (_t, s, _) = fixture();
+        let p = s.root.join("runtime.json");
+        fs::remove_file(&p).unwrap();
+        assert_eq!(capture_diagnostics(&s.root)["available"], false);
+        std::os::unix::fs::symlink(s.root.join("config.json"), &p).unwrap();
+        assert_eq!(capture_diagnostics(&s.root)["available"], false);
+        fs::remove_file(&p).unwrap();
+        atomic_json(&p,&json!({"schema_version":1,"reader_state":"invented","power_state":"awake","usb_export":false,"network_connected":false,"idle_since_unix":0,"bootstrap_unix":1000})).unwrap();
+        assert_eq!(capture_diagnostics(&s.root)["available"], false);
+    }
+    #[test]
+    fn logical_compact_reuses_db_pages_without_vacuum() {
+        let (_t, s, _) = fixture();
+        let id = plan(&s);
+        commit_verified(&s, &id, true, &mut Mock::default()).unwrap();
+        let p = s.root.join("events/sealed/synthetic.log");
+        s.db.execute(
+            "INSERT INTO sources VALUES (?,?)",
+            params![p.to_string_lossy(), sha(fs::read(&p).unwrap())],
+        )
+        .unwrap();
+        s.db.execute("INSERT INTO meta VALUES ('last_collect_blocked','0')", [])
+            .unwrap();
+        atomic_json(
+            &s.root.join("collection-state.json"),
+            &json!({"complete":true,"blocked":0}),
+        )
+        .unwrap();
+        let before = fs::metadata(s.root.join("ledger.sqlite")).unwrap().len();
+        let out = compact(&s).unwrap();
+        assert_eq!(out["vacuum_performed"], false);
+        assert_eq!(out["database_file_shrunk"], false);
+        assert!(fs::metadata(s.root.join("ledger.sqlite")).unwrap().len() >= before);
+        assert_eq!(s.status().unwrap()["confirmed_seconds"], 13);
+    }
+    #[test]
+    fn oversized_existing_ledger_is_never_truncated_or_reinitialized() {
+        let t = TempDir::new().unwrap();
+        fs::set_permissions(t.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = t.path().join("ledger.sqlite");
+        let f = fs::File::create(&path).unwrap();
+        f.set_len(LEDGER_LIMIT_BYTES + 4096).unwrap();
+        drop(f);
+        let before = fs::metadata(&path).unwrap().len();
+        assert!(Store::open(t.path()).is_err());
+        assert_eq!(fs::metadata(path).unwrap().len(), before);
+    }
+    #[test]
+    fn incompatible_ledger_page_size_cannot_bypass_four_mib_cap() {
+        let t = TempDir::new().unwrap();
+        fs::set_permissions(t.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = t.path().join("ledger.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA page_size=8192; CREATE TABLE existing(data TEXT); INSERT INTO existing VALUES('preserve');")
+            .unwrap();
+        drop(db);
+        assert!(Store::open(t.path()).is_err());
+        let db = Connection::open(path).unwrap();
+        assert_eq!(
+            db.query_row("SELECT data FROM existing", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "preserve"
+        );
+        let created: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='sources'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(created, 0);
+    }
+    #[test]
+    fn sqlite_full_rolls_back_without_erasing_pending_identity() {
+        let (_t, s, _) = fixture();
+        s.db.execute_batch("CREATE TABLE budget_payload(data BLOB)")
+            .unwrap();
+        let err =
+            s.db.execute(
+                "INSERT INTO budget_payload VALUES(zeroblob(?))",
+                [LEDGER_LIMIT_BYTES as i64],
+            )
+            .unwrap_err();
+        assert_eq!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::DiskFull));
+        assert_eq!(
+            s.db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(s.status().unwrap()["pending_seconds"], 13);
+        assert_eq!(
+            s.db.query_row("PRAGMA cache_spill", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            s.db.query_row("PRAGMA temp_store", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
         );
     }
 }
@@ -1570,6 +1876,7 @@ pub fn reconcile<T: network::Transport>(
     receipt["recheck_after"] = serde_json::to_value(&after)?;
     receipt["recheck_day_after"] = json!(day_after);
     if matched(&before, &after, day_before, day_after, seconds) {
+        storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
         let tx = store.db.unchecked_transaction()?;
         ensure!(
             tx.execute(
@@ -1627,7 +1934,7 @@ pub fn compact(store: &Store) -> Result<Value> {
         "compaction_blocked: collection incomplete"
     );
     gate(&store.root, false, now())?;
-    storage_budget(&store.root, 16 * 1024 * 1024)?;
+    storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
     let blocked: Option<String> = store
         .db
         .query_row(
@@ -1719,6 +2026,7 @@ pub fn compact(store: &Store) -> Result<Value> {
     }
     drop(sessions);
     gate(&store.root, false, now())?;
+    storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
     let tx = store.db.unchecked_transaction()?;
     for (path, hash) in &candidates {
         tx.execute("INSERT INTO compacted_sources VALUES (?,?) ON CONFLICT(path) DO UPDATE SET hash=excluded.hash",params![path,hash])?;
@@ -1735,8 +2043,10 @@ pub fn compact(store: &Store) -> Result<Value> {
         }
     }
     fs::File::open(&base)?.sync_all()?;
-    store.db.execute_batch("VACUUM")?;
+    // DELETE reuses freed SQLite pages. Do not run VACUUM in an automatic
+    // pipeline: it can need two database copies beyond the routine scratch
+    // budget and cannot race the collector under this PW2 profile.
     Ok(
-        json!({"state":"compacted","sealed_files_removed":candidates.len(),"session_ids_preserved":true}),
+        json!({"state":"compacted","sealed_files_removed":candidates.len(),"session_ids_preserved":true,"database_file_shrunk":false,"vacuum_performed":false}),
     )
 }

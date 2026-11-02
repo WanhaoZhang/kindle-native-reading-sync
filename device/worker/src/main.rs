@@ -46,7 +46,9 @@ fn run() -> Result<serde_json::Value> {
     match command {
         "status" => store.status(),
         "compact" => compact(&store),
-        "reconcile" => reconcile(&store, &value("--plan-id")?, &mut network::Live::default()),
+        "reconcile" => {
+            manual::reconcile_manual(&store, &value("--plan-id")?, &mut network::Live::default())
+        }
         "import-config" => import_config(&store, Path::new(&value("--inbox")?)),
         "export" => export(&store, Path::new(&value("--out")?)),
         "collect" => parsing::collect(
@@ -60,11 +62,11 @@ fn run() -> Result<serde_json::Value> {
                 if args.iter().any(|s| s == "--prepare") {
                     let book = value("--book-id")?;
                     let max = value("--max-seconds")?.parse()?;
-                    return prepare(&store, Some(&book), true, max);
+                    return manual::prepare_manual(&store, Some(&book), true, max);
                 }
                 if args.iter().any(|s| s == "--confirm") {
                     let id = value("--plan-id")?;
-                    return commit(&store, &id, true, &mut network::Live::default());
+                    return manual::commit_manual(&store, &id, true, &mut network::Live::default());
                 }
                 bail!("trial requires explicit prepare or exact plan confirmation")
             }

@@ -83,15 +83,40 @@ def probe_usb(mount='/Volumes/Kindle'):
         value=_read(probe)
         # Treat USB output as untrusted; return only documented non-credential fields.
         keys=('schema_version','profile','firmware','model_prefix','kernel','machine','libc',
-              'root','upstart','lipc','gzip','var_local_free_kib','supported')
+              'root','upstart','lipc','gzip','var_local_free_kib','supported','installation_supported',
+              'var_local_total_kib','var_local_used_kib','mem_total_kib','clock_unix',
+              'required_install_free_kib','required_runtime_free_kib','install_peak_extra_kib','retained_backup_kib','storage_budget_valid',
+              'ledger_current_bytes','raw_queue_over_limit','storage_budget_blocked',
+              'clock_local','clock_utc','root_mount_state','hardware_supported',
+              'power_state','wifi_state','usb_drive_mode','userstore_available')
         answer['root_probe']={k:value[k] for k in keys if k in value and
                               isinstance(value[k],(str,int,bool,type(None)))}
+        for k in ('schema_version','var_local_free_kib','var_local_total_kib','var_local_used_kib','mem_total_kib','clock_unix','required_install_free_kib','required_runtime_free_kib','install_peak_extra_kib','retained_backup_kib','ledger_current_bytes'):
+            v=answer['root_probe'].get(k)
+            if type(v) is not int or not 0<=v<=2**63-1:answer['root_probe'].pop(k,None)
+        for k in ('root','upstart','lipc','gzip','supported','installation_supported','hardware_supported','storage_budget_valid','raw_queue_over_limit'):
+            if type(answer['root_probe'].get(k)) is not bool:answer['root_probe'].pop(k,None)
         import re
         for k in ('profile','firmware','model_prefix','kernel','machine','libc'):
             v=answer['root_probe'].get(k)
             limit=4 if k=='model_prefix' else 100
             if not isinstance(v,str) or not re.fullmatch(r'[A-Za-z0-9._-]{1,'+str(limit)+'}',v):
                 answer['root_probe'].pop(k,None)
+        for k,pattern in (('clock_local',r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:[+-]\d{4}|Z)'),
+                          ('clock_utc',r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ'),
+                          ('root_mount_state',r'read_only|read_write|unknown'),
+                          ('storage_budget_blocked',r'none|ledger_over_limit|raw_queue_over_limit|measurement_unavailable'),
+                          ('power_state',r'active|Active|screenSaver|readyToSuspend|suspend|suspended|suspending|sleep|resuming|hibernate|unknown'),
+                          ('wifi_state',r'CONNECTED|DISCONNECTED|DISABLED|UNAVAILABLE|READY|NA|PENDING|unknown'),
+                          ('usb_drive_mode',r'[0-4]|unknown'),
+                          ('userstore_available',r'[01]|unknown')):
+            v=answer['root_probe'].get(k)
+            if not isinstance(v,str) or not re.fullmatch(pattern,v):answer['root_probe'].pop(k,None)
+        if isinstance(value.get('storage_profile'),dict):
+            profile=value['storage_profile']
+            safe={k:profile[k] for k in ('raw_queue_max_kib','ledger_max_kib','sqlite_rollback_max_kib','sqlite_journal_overhead_kib','system_reserve_kib','metadata_margin_kib') if type(profile.get(k)) is int and 0<=profile[k]<=1024*1024}
+            if profile.get('name')=='pw2-private-v1':safe['name']='pw2-private-v1'
+            answer['root_probe']['storage_profile']=safe
     return answer
 
 
@@ -214,7 +239,45 @@ def status(project_root, mount='/Volumes/Kindle'):
     private=Path(project_root).resolve()/'.weread';fence_path=private/FENCE
     fence=_read(fence_path) if fence_path.exists() else None
     value={'usb':probe_usb(mount),'handoff':fence,'mac_upload_fenced':bool(fence and fence.get('state') in ('prepared','exported','active')),
-           'device_status':None}
+           'device_status':None,'self_test':None,'tls_self_test':None,'install_result':None,'service_probe':None}
+    folder=Path(mount)/'.kindle-native-sync-export'
+    if not folder.is_symlink():
+        service=folder/'service-probe.json'
+        if service.is_file():
+            raw=_read(service)
+            safe={k:raw[k] for k in ('uptime_seconds','clock_ticks_per_second','process_count','total_rss_kib') if type(raw.get(k)) is int and raw[k]>=0}
+            safe.update({k:raw[k] for k in ('rss_complete','collector_running','adapter_running','truncated','acceptance_created') if type(raw.get(k)) is bool})
+            if isinstance(raw.get('processes'),list):
+                safe['processes']=[]
+                for item in raw['processes'][:64]:
+                    if not isinstance(item,dict):continue
+                    row={k:item[k] for k in ('pid','parent_pid','start_ticks','cpu_ticks','rss_kib') if type(item.get(k)) is int and item[k]>=0}
+                    if item.get('role') in ('collector','event_adapter','dependent'):row['role']=item['role']
+                    safe['processes'].append(row)
+            value['service_probe']=safe
+        result=folder/'install-result.json'
+        if result.is_file():
+            raw=_read(result)
+            if raw.get('state') in ('installed_collection_only','installation_failed') and type(raw.get('exit_code')) is int:
+                value['install_result']={'state':raw['state'],'exit_code':raw['exit_code'],'auto_upload_enabled':False}
+        for name,key in [('selftest.json','self_test'),('tls-selftest.json','tls_self_test')]:
+            path=folder/name
+            if not path.is_file():continue
+            raw=_read(path)
+            safe={k:raw[k] for k in ('private_filesystem_ok','network_contacted','acceptance_created') if type(raw.get(k)) is bool}
+            if type(raw.get('worker_exit_code')) is int:safe['worker_exit_code']=raw['worker_exit_code']
+            import re
+            if isinstance(raw.get('state'),str) and re.fullmatch('[a-z_]{1,40}',raw['state']):safe['state']=raw['state']
+            if isinstance(raw.get('actual_device'),dict):
+                d=raw['actual_device'];safe['actual_device']={k:d[k] for k in ('supported_firmware','supported_hardware','root') if type(d.get(k)) is bool}
+                for k in ('architecture','kernel_release','serial_prefix'):
+                    v=d.get(k);limit=4 if k=='serial_prefix' else 100
+                    if isinstance(v,str) and re.fullmatch(r'[A-Za-z0-9._-]{1,'+str(limit)+'}',v):safe['actual_device'][k]=v
+            if isinstance(raw.get('online_probe'),dict):
+                d=raw['online_probe'];safe['online_probe']={k:d[k] for k in ('json_response','https_certificate_validated','credentials_sent','network_writes','certificate_validation_disabled') if type(d.get(k)) is bool}
+                if type(d.get('http_status')) is int:safe['online_probe']['http_status']=d['http_status']
+                if d.get('state') in ('completed','failed'):safe['online_probe']['state']=d['state']
+            value[key]=safe
     path=Path(mount)/'.kindle-native-sync-export/status.json'
     if path.is_file() and not path.parent.is_symlink():
         exported=_read(path)
@@ -226,6 +289,13 @@ def status(project_root, mount='/Volumes/Kindle'):
             value['device_status']['state']=exported['state']
         if isinstance(exported.get('validation'),dict):
             value['device_status']['validation']={k:exported['validation'][k] for k in ('protocol_validation','device_validation') if type(exported['validation'].get(k)) is bool}
+        if isinstance(exported.get('capture'),dict):
+            raw=exported['capture']
+            safe={k:raw[k] for k in ('available','usb_export','network_connected','capture_blocked','coverage_gap') if type(raw.get(k)) is bool}
+            safe.update({k:raw[k] for k in ('bootstrap_unix','idle_since_unix','active_bytes','sealed_bytes','sealed_files') if type(raw.get(k)) is int and raw[k]>=0})
+            for key,allowed in [('reader_state',('active','idle','unknown')),('power_state',('awake','sleeping','unknown'))]:
+                if raw.get(key) in allowed:safe[key]=raw[key]
+            value['device_status']['capture']=safe
         for key in ('configured','collect_only_default','auto_sync_enabled'):
             if type(exported.get(key)) is bool:value['device_status'][key]=exported[key]
         if isinstance(exported.get('states'),dict):

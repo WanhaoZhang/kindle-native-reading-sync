@@ -13,8 +13,8 @@ The default log source is `/var/log/messages`, with rotated logs in `/var/local/
 
 - `--root DIR`: private service data directory; default `/var/local/kindle-native-sync`. It must be owned by the effective user and mode `0700`.
 - `--log FILE`, `--rotated-dir DIR`: input sources, useful for synthetic tests.
-- `--queue-bytes N`: default 16 MiB across raw active/sealed events.
-- `--reserve-bytes N`: default 20 MiB filesystem space reserve.
+- `--queue-bytes N`: default 4 MiB across raw active/sealed events for the PW2 profile.
+- `--reserve-bytes N`: default 24 MiB + 64 KiB free space: 20 MiB for the system, 4 MiB for the worker's bounded SQLite transaction and 64 KiB for journal overhead. The installer checks the combined component, queue, ledger and transaction budget before deployment.
 - `--emit 'power awake'`: send one trusted local adapter event to the existing `ROOT/control.fifo` (mode `0600`). Does not start a collector.
 
 Allowed adapter lines are `power awake`, `power sleeping`, `usb 0`, `usb 1`, `network 0`, and `network 1`. `reader active` / `reader idle` exist for explicit trusted reader-event adapters and tests; do not generate idle from lack of page turns. Normal operation reads OpenBook/CloseBook directly from native logs. `maintenance retry` explicitly rechecks a stopped quota; `maintenance acknowledge-gap` clears a coverage warning only after human verification. `rescan now` is an overflow/recovery test event and records a coverage warning.
@@ -31,7 +31,7 @@ Raw filtered lines append to `events/active.log`. At close, sleep, USB entry, an
 
 The live inode stays open across rename/unlink, so trailing bytes can be drained even when the old filename disappears. Directory rescans recover rotated plain logs. Compressed native archives are decompressed using the existing `gzip` command only outside active reading, after a one-shot size-stability delay; stable raw event identities in the parser/ledger must deduplicate overlap with live capture. This is not a promise that already-pruned source data can be recovered. Oversized lines, unresolved decode failures and overflow recovery report a coverage warning rather than inventing missing time.
 
-Queue limits do not delete unconfirmed data. A storage block remains explicit until maintenance rechecks space. No periodic low-space retry or Wi-Fi wakeup is introduced. Filesystem quota/free-space scans are cached, rather than rescanning all sealed segments for every event. Real PW2 CPU, RAM, battery, USB transition ordering, and inotify behaviour still require device acceptance tests.
+Queue limits do not delete unconfirmed data. A storage block remains explicit until maintenance rechecks space. No periodic low-space retry or Wi-Fi wakeup is introduced. The sealed-directory size scan is cached; available filesystem blocks are checked fresh before each retained line. Capture checks preserve the configured 24 MiB plus 64 KiB floor, while atomic checkpoint/status writes independently preserve 20 MiB plus block-rounded temporary bytes and 64 KiB overhead. Normal source checkpoints additionally preserve the full capture/worker-scratch floor plus their own block-rounded temporary size; only the small emergency runtime marker uses the lower system-only floor. This permits a failure status below the capture threshold without consuming the system reserve. Short failed appends roll back; a failed rollback is quarantined and cannot be sealed. These are best-effort guards against concurrent firmware writers, not an exclusive filesystem reservation. Real PW2 CPU, RAM, battery, USB transition ordering, and inotify behaviour still require device acceptance tests.
 
 ## Tests
 

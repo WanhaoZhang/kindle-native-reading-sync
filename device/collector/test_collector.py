@@ -94,6 +94,15 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(self.state()['power_state'],'sleeping');self.assertTrue(list((self.root/'events'/'sealed').glob('*.log')))
         self.event('usb 1');before=self.data();self.append(self.line(suffix='TotalTime:27000;'));time.sleep(.15);self.assertEqual(before,self.data())
         self.event('usb 0');self.wait(lambda:'27000' in self.data());self.assertFalse(self.state()['usb_export'])
+    def test_storage_guards_fresh_space_rounding_metadata_floor_and_cancellation(self):
+        source=Path(__file__).resolve().parent/'test_storage.c'
+        unit=self.path/'storage-tests'
+        subprocess.run([os.environ.get('CC','cc'),'-O2','-std=c11','-Wall','-Wextra','-Werror',str(source),'-o',str(unit)],check=True)
+        home=self.path/'storage-unit';home.mkdir(mode=0o700)
+        result=subprocess.run([str(unit),str(home)],capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('cancellation: passed',result.stdout)
+
     def test_startup_and_respawn_request_adapter_state_replay(self):
         path=self.root/'adapter-control.fifo';os.mkfifo(path,0o600)
         fd=os.open(path,os.O_RDWR|os.O_NONBLOCK);self.addCleanup(os.close,fd)
