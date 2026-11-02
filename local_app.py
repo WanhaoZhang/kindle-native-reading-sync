@@ -34,7 +34,6 @@ class LocalApp:
         self.login_output = None
         self.qr_path = None
         self.login_started = None
-        self.login_purpose = 'mac'
 
     def json_file(self, relative, default=None):
         try:
@@ -48,11 +47,11 @@ class LocalApp:
             return {'state': 'idle'}
         code = process.poll()
         if code is None:
-            return {'state': 'waiting', 'purpose': self.login_purpose, 'qr_url': '/login-qr.png?v=' + str(self.login_started)
+            return {'state': 'waiting', 'qr_url': '/login-qr.png?v=' + str(self.login_started)
                     if self.qr_path and self.qr_path.is_file() else None,
                     'message': '请用微信扫描并在手机确认。'}
         if code == 0:
-            return {'state': 'success', 'purpose': self.login_purpose, 'message': '微信读书连接成功。'}
+            return {'state': 'success', 'message': '微信读书连接成功。'}
         return {'state': 'error', 'message': '扫码未完成或已过期，请重新点击登录。'}
 
     def state(self):
@@ -106,29 +105,9 @@ class LocalApp:
         imported = self.engine.import_results()
         return {'import': imported, 'state': self.state()}
 
-    def device_state(self):
-        from device_bridge import status
-        value = status(self.base)
-        value['device_auth_ready'] = False
-        path = self.base / '.weread/device-auth.json'
-        if path.is_file():
-            from weread_readonly import load_auth
-            try:
-                load_auth(path)
-                value['device_auth_ready'] = True
-            except BridgeError:
-                pass
-        value['login'] = self.login_status()
-        return value
-
-    def start_login(self, purpose='mac'):
-        if purpose not in ('mac', 'kindle'):
-            raise ValueError('登录用途无效。')
+    def start_login(self):
         if self.login_process and self.login_process.poll() is None:
-            if self.login_purpose != purpose:
-                raise ValueError('另一项扫码正在进行，请先完成或等待其结束。')
             return self.login_status()
-        self.login_purpose = purpose
         private = self.base / '.weread'
         private.mkdir(mode=0o700, exist_ok=True)
         private.chmod(0o700)
@@ -142,7 +121,7 @@ class LocalApp:
         python = self.base / '.venv-bridge/bin/python'
         if not python.is_file():
             raise ValueError('本地扫码运行环境不存在，请运行项目安装步骤。')
-        auth_path = private / ('device-auth.json' if purpose == 'kindle' else 'auth.json')
+        auth_path = private / 'auth.json'
         command = [str(python), str(self.base / 'weread_readonly.py'), '--credentials', str(auth_path), 'login', '--online',
                    '--wait-seconds', '300', '--qr-png', str(self.qr_path)]
         if auth_path.exists():
@@ -153,23 +132,6 @@ class LocalApp:
 
     def post(self, path, body):
         with self.lock:
-            if path == '/api/device/login':
-                return self.start_login('kindle')
-            if path == '/api/device/handoff':
-                from device_bridge import prepare_handoff
-                readiness = self.device_state()
-                if not readiness['device_auth_ready']:
-                    raise ValueError('请先完成 Kindle 专用扫码，再交接上传权。')
-                probe = readiness.get('usb', {}).get('root_probe') or {}
-                if probe.get('supported') is not True or probe.get('root') is not True:
-                    raise ValueError('请先在 Kindle 运行并导出 root 自检，再交接上传权。')
-                return prepare_handoff(self.base, confirmed=body.get('confirmed') is True,
-                                       preserve_pending=body.get('preserve_pending') is True)
-            if path == '/api/device/config':
-                if body.get('confirmed') is not True:
-                    raise ValueError('导出将把专用凭据暂存到 USB，请先确认。')
-                from device_bridge import export_config
-                return export_config(self.base, '/Volumes/Kindle')
             if path == '/api/import':
                 return self.analyze()
             if path == '/api/import_saved':
@@ -235,13 +197,6 @@ def make_handler(app):
                 return self.response(200, {'csrf_token': app.csrf})
             if path == '/':
                 return self.response(200, (app.base / 'local-web/index.html').read_bytes(), 'text/html; charset=utf-8')
-            if path == '/device':
-                return self.response(200, (app.base / 'local-web/device.html').read_bytes(), 'text/html; charset=utf-8')
-            if path == '/api/device':
-                try:
-                    return self.response(200, {'ok': True, 'data': app.device_state()})
-                except Exception:
-                    return self.response(500, {'ok': False, 'error': '设备配置状态不可读取，请保留原有文件。'})
             if path == '/api/status':
                 try:
                     return self.response(200, {'ok': True, 'data': app.state()})

@@ -29,7 +29,7 @@ target/
 .DS_Store
 *.log
 
-# Device build tools and private deployment artifacts
+# Legacy build tools and private deployment artifacts from the pre-split version
 .device-work/
 dist/
 device/worker/target/

@@ -1,4 +1,4 @@
-# 开发说明
+# 网页导入版开发说明
 
 ## 模块
 
@@ -6,7 +6,7 @@
 - `readinglog-cli`：ReadingLog Rust 库的本机适配器；阅读会话、计时、跨日切分与精确计数匹配来自上游。额外的 BufferedLogger 兼容只补身份，不增加阅读时间。
 - `analyze_kindle.py` / `kindle_reports.py`：复制、调用解析器并生成报表。
 - `weread_readonly.py`：显式扫码与查询，封闭端点清单，拒绝跨域认证转发。
-- `weread_upload.py`：纯协议、签名与旧式单片段试验入口。新用户使用网页和同步引擎；命令行单片段入口仅用于开发，不提供真实样本。
+- `weread_upload.py`：纯协议、签名和标准传输层；旧 `--commit` 命令行写入入口已停用，参数解析后即拒绝，不读取样本/凭据或联网。历史 `commit_once` 函数仅为合成回归参考，不作为受支持的用户接口。实际写入统一使用网页的 `SyncEngine`。
 - `sync_engine.py`：累计观测、账户隔离、书籍映射、不可变预览、提交账本、只读复核。
 - `local_app.py` / `local-web/index.html`：只监听 localhost 的网页服务，不需要前端构建系统。
 
@@ -29,3 +29,7 @@ ReadingLog 固定源码的 native 和 desktop workspace 文件保存在 vendor�
 ## 可选 CI
 
 `docs/ci-example.yml` 提供 Python（Linux/macOS）与 Rust 离线测试模板。需要时将它复制到 `.github/workflows/tests.yml` 并提交；通过 GitHub CLI 上传工作流需要额外的 workflow 授权。当前仓库仅提供模板，未启用 Actions。
+
+## 与 Kindle 项目的边界
+
+Kindle 服务、KUAL、ARM 打包与首次配置助手在独立的 [kindle-device-autosync](https://github.com/WanhaoZhang/kindle-device-autosync) 仓库维护。本仓库不再提供 `/device` 路由。`sync_engine.py` 内 `device-handoff.json` 存在即拒绝写入的门禁保留；它不依赖另一个仓库，防止迁移后旧 Mac 再次上传。来源与升级方式见 [拆分说明](REPOSITORY_SPLIT.md)。

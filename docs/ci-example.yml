@@ -15,11 +15,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m unittest discover -v
-      - run: python device/collector/test_collector.py
   rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.91.0 --profile minimal
       - run: cargo +1.91.0 test --locked --manifest-path readinglog-cli/Cargo.toml
-      - run: cargo +1.91.0 test --locked --manifest-path device/worker/Cargo.toml

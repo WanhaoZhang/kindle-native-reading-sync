@@ -35,6 +35,11 @@ class MockTransport:
 
 
 class OfflineUploadTests(unittest.TestCase):
+    def test_retired_cli_write_stops_before_reading_sample_or_credentials(self):
+        with patch.object(upload, 'load_auth') as auth, patch.object(upload, 'UploadTransport') as transport, contextlib.redirect_stdout(io.StringIO()):
+            code=upload.main(['--commit','--sample','/nonexistent-synthetic-sample.json','--approve-sample-id','synthetic-id'])
+        self.assertEqual(code,1);auth.assert_not_called();transport.assert_not_called()
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         folder=Path(self.tmp.name);source=folder/"synthetic.log"

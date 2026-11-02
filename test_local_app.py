@@ -32,7 +32,6 @@ class LocalAppTests(unittest.TestCase):
         self.base = Path(self.temp.name)
         (self.base / 'local-web').mkdir()
         (self.base / 'local-web/index.html').write_text('<html>local tool</html>')
-        (self.base / 'local-web/device.html').write_text('<html>device setup</html>')
         (self.base / '.weread').mkdir()
         (self.base / '.weread/auth.json').write_text('SECRET_MUST_NOT_BE_SERVED')
         self.engine = FakeEngine()
@@ -98,22 +97,16 @@ class LocalAppTests(unittest.TestCase):
         self.assertEqual(data['coverage']['start'], '2026-11-01')
         self.assertEqual(self.engine.commits, [])
 
-    def test_device_page_and_status_never_return_credentials(self):
-        code, raw = self.request('GET', '/device')
-        self.assertEqual(code, 200)
-        self.assertIn(b'device setup', raw)
-        code, raw = self.request('GET', '/api/device')
-        self.assertEqual(code, 200)
-        self.assertFalse(json.loads(raw)['data']['device_auth_ready'])
-        self.assertNotIn(b'SECRET', raw)
-        self.assertEqual(self.engine.commits, [])
-
-    def test_device_handoff_requires_new_auth_and_export_requires_confirm(self):
-        code, _ = self.request('POST', '/api/device/handoff', {'confirmed': True}, self.mutation_headers())
-        self.assertEqual(code, 400)
+    def test_device_configuration_belongs_to_separate_project(self):
+        for path in ('/device','/api/device'):
+            code, raw = self.request('GET', path)
+            self.assertEqual(code, 404)
+            self.assertNotIn(b'SECRET', raw)
+        for path in ('/api/device/login','/api/device/handoff','/api/device/config'):
+            code, _ = self.request('POST', path, {'confirmed':True}, self.mutation_headers())
+            self.assertEqual(code, 400)
         self.assertFalse((self.base/'.weread/device-handoff.json').exists())
-        code, _ = self.request('POST', '/api/device/config', {}, self.mutation_headers())
-        self.assertEqual(code, 400)
+        self.assertEqual(self.engine.commits, [])
 
 
 if __name__ == '__main__':

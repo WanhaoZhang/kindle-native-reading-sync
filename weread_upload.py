@@ -301,7 +301,11 @@ def position(value):
 
 
 def commit_once(sample, approved_id, credentials, ledger_path, transport=None):
-    """Only caller may authorize. Never called by dry-run or import."""
+    """Historical protocol test helper; the supported writer is SyncEngine.
+
+    Not exposed by the CLI: it lacks the unified account/day verification and
+    handoff locking of the web workflow. Retained for synthetic regression only.
+    """
     prepared = prepare(sample)
     sample_id = prepared["sample_id"]
     if approved_id != sample_id:
@@ -379,27 +383,24 @@ def commit_once(sample, approved_id, credentials, ledger_path, transport=None):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="默认仅离线预备纯时长样本；实际写入必须commit和精确批准ID。")
+    parser = argparse.ArgumentParser(description="离线协议样本预备工具。实际写入请使用网页版同步预览和确认。")
     parser.add_argument("--sample", type=Path, help="来自真实原生counted事件的小样本JSON，最多60秒")
     parser.add_argument("--context", type=Path, help="可选私有签名配置JSON；不接受accessToken或refreshToken")
     parser.add_argument("--output", type=Path, help="可选0600保存完整预备包；已有文件不覆盖")
-    parser.add_argument("--commit", action="store_true", help="实际预检和单次提交；仅在用户批准具体样本后使用")
+    parser.add_argument("--commit", action="store_true", help="已停用的旧式写入选项；使用网页版同步预览和确认")
     parser.add_argument("--approve-sample-id", help="用户已批准的精确sample_id")
     parser.add_argument("--credentials", type=Path, default=Path(__file__).parent / ".weread" / "auth.json")
     parser.add_argument("--ledger", type=Path, default=Path(__file__).parent / ".weread" / "upload-ledger.sqlite")
     args = parser.parse_args(argv)
+    if args.commit:
+        print("旧式单片段写入入口已停用。请启动网页版，通过同步预览与确认提交，保留统一账本及设备交接保护。")
+        return 1
     if not args.sample:
         parser.print_help()
         return 0
     try:
         sample = json.loads(args.sample.read_text(encoding="utf-8"))
         verify_evidence(sample)
-        if args.commit:
-            if not args.approve_sample_id:
-                raise ValueError("Explicit approval id is required")
-            result = commit_once(sample, args.approve_sample_id, load_auth(args.credentials), args.ledger)
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-            return 0 if result["state"] == "confirmed" and result["verification"] == "matched" else 2
         context = json.loads(args.context.read_text(encoding="utf-8")) if args.context else None
         if context and any(key in context for key in ("accessToken", "refreshToken", "cookies")):
             raise ValueError("Signing context must not contain login tokens or cookies")
